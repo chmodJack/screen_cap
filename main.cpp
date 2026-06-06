@@ -13,6 +13,7 @@
 #include <windowsx.h>              // GET_X_LPARAM / GET_Y_LPARAM
 #include <timeapi.h>               // timeBeginPeriod / timeEndPeriod
 #include <cstdio>                  // swprintf
+#include <cstdint>                 // uint8_t / int64_t
 #pragma comment(lib, "winmm.lib")
 
 // ======================= 可配置参数 =======================
@@ -171,7 +172,7 @@ LRESULT CALLBACK SelectorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         bool R  = pt.x > W - GRAB;
         bool T  = pt.y < GRAB;
         bool Bo = pt.y > H - GRAB;
-        if (T && L) return HTTOPLEFT;
+        if (T && L) return HTCAPTION;    // 左上角 -> 整体平移(其余角仍为缩放)
         if (T && R) return HTTOPRIGHT;
         if (Bo && L) return HTBOTTOMLEFT;
         if (Bo && R) return HTBOTTOMRIGHT;

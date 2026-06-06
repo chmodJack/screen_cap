@@ -18,7 +18,7 @@
 // ======================= 可配置参数 =======================
 static int g_targetFps = 120;      // 预览目标帧率上限
 
-static const int B    = 3;         // 边框线宽(像素), 越小越细
+static const int B    = 2;         // 边框线宽(像素), 越小越细
 static const int GRAB = 10;        // 四角抓取判定长度(沿边方向)
 static const int MINW = 40;        // 选区最小宽
 static const int MINH = 40;        // 选区最小高
@@ -86,6 +86,12 @@ static void captureAndShow() {
     if (h < 1) h = 1;
     if (w != g_cap.w || h != g_cap.h) {       // 选区尺寸变了 -> 重建捕获位图
         if (!g_cap.init(w, h)) return;
+        // 预览窗口客户区同步调整为与选区等大 (1:1 显示)
+        RECT pr = { 0, 0, w, h };
+        AdjustWindowRect(&pr, WS_OVERLAPPEDWINDOW, FALSE);
+        SetWindowPos(g_preview, nullptr, 0, 0,
+                     pr.right - pr.left, pr.bottom - pr.top,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
     g_cap.grab(x, y);
     blitToWindow(g_preview, g_previewDC);
@@ -149,13 +155,10 @@ LRESULT CALLBACK SelectorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         HDC hdc = BeginPaint(hwnd, &ps);
         RECT c; GetClientRect(hwnd, &c);
 
-        // 反色: 取边框身后的桌面像素求反 (NOTSRCCOPY)。
-        // 窗口区域已裁剪成边框环, 所以只有边框环被绘制。
-        POINT org = { 0, 0 };
-        ClientToScreen(hwnd, &org);
-        HDC screen = GetDC(nullptr);
-        BitBlt(hdc, 0, 0, c.right, c.bottom, screen, org.x, org.y, NOTSRCCOPY);
-        ReleaseDC(nullptr, screen);
+        // 纯红色边框。窗口区域已裁剪成边框环, 填满客户区即只显示那一圈。
+        HBRUSH red = CreateSolidBrush(RGB(255, 0, 0));
+        FillRect(hdc, &c, red);
+        DeleteObject(red);
 
         EndPaint(hwnd, &ps);
         return 0;

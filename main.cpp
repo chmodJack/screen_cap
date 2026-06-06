@@ -27,11 +27,24 @@ static const int MINH = 40;        // 选区最小高
 static int g_initRx = 300, g_initRy = 200, g_initRw = 640, g_initRh = 360;
 // =========================================================
 
+// ---- 通用实时帧 (零依赖): 任何识别算法都从这里开始 ----
+// 像素布局: BGRA, 8位/通道, top-down(第一行在前), 连续, stride = width*4
+struct Frame {
+    const uint8_t* data;        // 像素首地址 (BGRA)
+    int     width;
+    int     height;
+    int     stride;             // 每行字节数
+    int64_t timestampMs;
+};
+
 // ---- 捕获用的 GDI 资源 (尺寸变化时才重建) ----
+// 用 CreateDIBSection 而非 CreateCompatibleBitmap: 抓完帧后像素直接可读(bits),
+// 无需再 GetDIBits 拷贝 —— 既能显示, 又能零拷贝交给识别算法。
 struct Capture {
     HDC     screenDC = nullptr;
     HDC     memDC    = nullptr;
     HBITMAP bmp      = nullptr;
+    void*   bits     = nullptr;   // 直接指向 BGRA 像素
     int     w = 0, h = 0;
 
     bool init(int width, int height) {
@@ -41,16 +54,26 @@ struct Capture {
         if (!screenDC) return false;
         memDC = CreateCompatibleDC(screenDC);
         if (!memDC) return false;
-        bmp = CreateCompatibleBitmap(screenDC, w, h);
+
+        BITMAPINFO bi = {};
+        bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth       = w;
+        bi.bmiHeader.biHeight      = -h;       // 负 = top-down
+        bi.bmiHeader.biPlanes      = 1;
+        bi.bmiHeader.biBitCount    = 32;       // BGRA
+        bi.bmiHeader.biCompression = BI_RGB;
+
+        bmp = CreateDIBSection(screenDC, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
         if (!bmp) return false;
         SelectObject(memDC, bmp);
         return true;
     }
     void grab(int srcX, int srcY) {
         BitBlt(memDC, 0, 0, w, h, screenDC, srcX, srcY, SRCCOPY);
+        // 抓完: (uint8_t*)bits 即本帧 BGRA 数据, stride = w*4
     }
     void release() {
-        if (bmp)      { DeleteObject(bmp);            bmp = nullptr; }
+        if (bmp)      { DeleteObject(bmp);            bmp = nullptr; bits = nullptr; }
         if (memDC)    { DeleteDC(memDC);              memDC = nullptr; }
         if (screenDC) { ReleaseDC(nullptr, screenDC); screenDC = nullptr; }
     }
@@ -61,6 +84,28 @@ static Capture g_cap;
 static HWND    g_selector = nullptr;   // 选区线框窗口
 static HWND    g_preview  = nullptr;   // 预览窗口
 static HDC     g_previewDC = nullptr;  // 复用的预览窗口 DC
+
+// 毫秒时间戳 (用于给每帧打时间)
+static int64_t nowMs() {
+    static LARGE_INTEGER f = {};
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    return t.QuadPart * 1000 / f.QuadPart;
+}
+
+// ============================================================
+//  识别回调: 每抓到一帧就调用这里。把你的自定义特征识别写在这。
+//  纯 CPU、零依赖, 直接遍历 f.data (BGRA) 即可。
+//  注意: 本函数在抓屏线程上同步执行, 太重的识别请改为投递到独立线程
+//        (用"只保留最新一帧"的缓冲), 以免拖累预览帧率。
+// ============================================================
+static void onFrame(const Frame& f) {
+    // 示例(占位): 计算画面平均亮度, 什么都不做。删掉换成你的算法。
+    (void)f;
+    // 例: 访问像素 (x,y) 的分量 —
+    //   const uint8_t* p = f.data + y * f.stride + x * 4;
+    //   uint8_t B_ = p[0], G_ = p[1], R_ = p[2], A_ = p[3];
+}
 
 // 把内存位图画到预览窗口: 等大则 1:1 直拷, 否则快速拉伸适配
 static void blitToWindow(HWND hwnd, HDC hdc) {
@@ -94,6 +139,11 @@ static void captureAndShow() {
                      SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
     g_cap.grab(x, y);
+
+    // 抓到原始帧 -> 交给识别回调 (零拷贝, 直接引用 DIBSection 像素)
+    Frame f{ (const uint8_t*)g_cap.bits, g_cap.w, g_cap.h, g_cap.w * 4, nowMs() };
+    onFrame(f);
+
     blitToWindow(g_preview, g_previewDC);
 }
 

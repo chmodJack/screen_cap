@@ -18,3 +18,15 @@ endif()
 
 # GDI 等 API 在 Gdi32/User32 中, 通常 MSVC 会自动链接, 这里显式写出更稳妥
 target_link_libraries(screen_cap PRIVATE Gdi32 User32)
+
+# ---- 示例识别插件 plugin.dll ----
+# 与 exe 输出到同一目录, 这样 exe 启动时能在自身目录找到它。
+add_library(plugin SHARED plugin_example.cpp)
+target_compile_definitions(plugin PRIVATE UNICODE _UNICODE)
+if (MSVC)
+    target_compile_options(plugin PRIVATE /utf-8)
+endif()
+set_target_properties(plugin PROPERTIES
+    OUTPUT_NAME "plugin"
+    PREFIX ""                                  # 不要 lib 前缀, 输出就叫 plugin.dll
+    RUNTIME_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:screen_cap>")

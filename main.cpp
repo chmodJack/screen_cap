@@ -14,6 +14,8 @@
 #include <timeapi.h>               // timeBeginPeriod / timeEndPeriod
 #include <cstdio>                  // swprintf
 #include <cstdint>                 // uint8_t / int64_t
+#include <cwchar>                  // wcsrchr / wcscpy_s
+#include "plugin_api.h"            // 外部识别插件 (DLL) 接口
 #pragma comment(lib, "winmm.lib")
 
 // ======================= 可配置参数 =======================
@@ -26,7 +28,40 @@ static const int MINH = 40;        // 选区最小高
 
 // 选区默认位置 / 大小 (内部捕获区域, 屏幕坐标)
 static int g_initRx = 300, g_initRy = 200, g_initRw = 640, g_initRh = 360;
+
+// 外部识别插件 DLL 文件名 (从 exe 所在目录加载)
+static const wchar_t* g_pluginName = L"plugin.dll";
 // =========================================================
+
+// ---- 外部插件 (DLL) ----
+static HMODULE                g_plugin   = nullptr;
+static screencap_on_init_fn   g_on_init  = nullptr;
+static screencap_on_frame_fn  g_on_frame = nullptr;
+static screencap_on_exit_fn   g_on_exit  = nullptr;
+
+// 从 exe 所在目录加载插件, 解析三个导出函数 (都可选)。
+// 返回 false 表示 DLL 文件未能加载 (识别功能将被禁用, 程序仍可运行)。
+static bool loadPlugin() {
+    wchar_t path[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);     // exe 完整路径
+    wchar_t* slash = wcsrchr(path, L'\\');
+    if (slash) wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - path), g_pluginName);
+
+    g_plugin = LoadLibraryW(path);
+    if (!g_plugin) g_plugin = LoadLibraryW(g_pluginName);  // 退而求其次: 按搜索路径找
+    if (!g_plugin) return false;
+
+    g_on_init  = (screencap_on_init_fn)  GetProcAddress(g_plugin, "on_init");
+    g_on_frame = (screencap_on_frame_fn) GetProcAddress(g_plugin, "on_frame");
+    g_on_exit  = (screencap_on_exit_fn)  GetProcAddress(g_plugin, "on_exit");
+    return true;
+}
+
+static void unloadPlugin() {
+    if (g_on_exit) g_on_exit();          // 先让插件清理
+    g_on_init = nullptr; g_on_frame = nullptr; g_on_exit = nullptr;
+    if (g_plugin) { FreeLibrary(g_plugin); g_plugin = nullptr; }
+}
 
 // ---- 通用实时帧 (零依赖): 任何识别算法都从这里开始 ----
 // 像素布局: BGRA, 8位/通道, top-down(第一行在前), 连续, stride = width*4
@@ -95,17 +130,19 @@ static int64_t nowMs() {
 }
 
 // ============================================================
-//  识别回调: 每抓到一帧就调用这里。把你的自定义特征识别写在这。
-//  纯 CPU、零依赖, 直接遍历 f.data (BGRA) 即可。
-//  注意: 本函数在抓屏线程上同步执行, 太重的识别请改为投递到独立线程
-//        (用"只保留最新一帧"的缓冲), 以免拖累预览帧率。
+//  每抓到一帧调用: 转交给外部插件 DLL 的 on_frame。
+//  插件可就地修改像素(BGRA), 修改后的结果会显示在预览窗口里。
+//  注意: 在抓屏线程上同步执行, 插件处理太重会拖累预览帧率。
 // ============================================================
 static void onFrame(const Frame& f) {
-    // 示例(占位): 计算画面平均亮度, 什么都不做。删掉换成你的算法。
-    (void)f;
-    // 例: 访问像素 (x,y) 的分量 —
-    //   const uint8_t* p = f.data + y * f.stride + x * 4;
-    //   uint8_t B_ = p[0], G_ = p[1], R_ = p[2], A_ = p[3];
+    if (!g_on_frame) return;
+    ScreenFrame sf;
+    sf.data        = const_cast<uint8_t*>(f.data);   // 允许插件就地修改
+    sf.width       = f.width;
+    sf.height      = f.height;
+    sf.stride      = f.stride;
+    sf.timestampMs = f.timestampMs;
+    g_on_frame(&sf);
 }
 
 // 把内存位图画到预览窗口: 等大则 1:1 直拷, 否则快速拉伸适配
@@ -140,12 +177,13 @@ static void captureAndShow() {
                      SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
     g_cap.grab(x, y);
+    GdiFlush();   // 确保 BitBlt 已写入 DIBSection 内存, 插件才能读到正确像素
 
-    // 抓到原始帧 -> 交给识别回调 (零拷贝, 直接引用 DIBSection 像素)
+    // 抓到原始帧 -> 交给插件 (零拷贝, 直接引用 DIBSection 像素)
     Frame f{ (const uint8_t*)g_cap.bits, g_cap.w, g_cap.h, g_cap.w * 4, nowMs() };
     onFrame(f);
 
-    blitToWindow(g_preview, g_previewDC);
+    blitToWindow(g_preview, g_previewDC);   // 显示(可能被插件修改过的)像素
 }
 
 // 根据窗口当前尺寸重建"空心细线框"的窗口区域 (外框 - 中间洞 = 边框环)
@@ -302,6 +340,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     ShowWindow(g_preview, nCmdShow);
     g_previewDC = GetDC(g_preview);
 
+    // ---- 环境就绪, 加载外部插件并初始化 ----
+    if (!loadPlugin()) {
+        MessageBoxW(g_preview,
+                    L"未找到插件 plugin.dll (识别功能禁用)。\n程序仍会正常显示捕获画面。",
+                    L"提示", MB_ICONINFORMATION);
+    } else if (g_on_init) {
+        if (g_on_init() != 0) {              // 插件初始化失败 -> 中止
+            MessageBoxW(g_preview, L"插件 on_init 返回失败, 程序退出。", L"错误", MB_ICONERROR);
+            unloadPlugin();
+            return 1;
+        }
+    }
+
     // ---- 主循环: 抓屏 + 刷新预览 + FPS 统计 ----
     LARGE_INTEGER freq, last, fpsTimer;
     QueryPerformanceFrequency(&freq);
@@ -344,6 +395,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         }
     }
 
+    unloadPlugin();   // 调用插件 on_exit 并卸载 DLL
     if (g_previewDC) ReleaseDC(g_preview, g_previewDC);
     timeEndPeriod(1);
     g_cap.release();

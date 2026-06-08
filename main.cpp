@@ -343,7 +343,7 @@ static uint8_t* g_cursorBits = nullptr;
 static int      g_cursorBufW = 0, g_cursorBufH = 0;
 
 static void ensureCursorDIB(int w, int h) {
-    if (g_cursorDC && g_cursorBufW >= w && g_cursorBufH >= h) return;
+    if (g_cursorDC && g_cursorBufW == w && g_cursorBufH == h) return;
     if (g_cursorDIB) DeleteObject(g_cursorDIB);
     if (g_cursorDC)  DeleteDC(g_cursorDC);
     g_cursorDC = CreateCompatibleDC(nullptr);

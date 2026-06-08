@@ -16,8 +16,8 @@ if (MSVC)
     target_compile_options(screen_cap PRIVATE /utf-8)
 endif()
 
-# GDI 等 API 在 Gdi32/User32 中, 通常 MSVC 会自动链接, 这里显式写出更稳妥
-target_link_libraries(screen_cap PRIVATE Gdi32 User32)
+# D3D11 + DXGI (Desktop Duplication) + GDI (窗口/预览)
+target_link_libraries(screen_cap PRIVATE d3d11 dxgi Gdi32 User32)
 
 # ---- 示例识别插件 plugin.dll ----
 # 与 exe 输出到同一目录, 这样 exe 启动时能在自身目录找到它。

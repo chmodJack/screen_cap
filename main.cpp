@@ -1,35 +1,39 @@
-// screen_cap - 动态选区屏幕捕获 (纯 CPU / GDI 版本)
+// screen_cap - 动态选区屏幕捕获 (D3D11 Desktop Duplication 版本)
 //
 // 两个窗口:
 //   [选区窗口] 一个"空心"细线框: 中间挖洞(SetWindowRgn) -> 桌面透出、鼠标穿透、
-//             抓屏时拍到的是洞后面的桌面而不是边框本身。边框环用 NOTSRCCOPY 把
-//             身后的桌面像素取反绘制 -> 反色线框。只能拖边/拖角缩放(无整体移动)。
+//             抓屏时拍到的是洞后面的桌面而不是边框本身。边框环用纯红色填充。
+//             只能拖边/拖角缩放(左上角可整体拖动)。
 //   [预览窗口] 实时显示线框内部区域, 自动跟随选区大小变化。
 //
-// 捕获用 GDI BitBlt(srcDC=屏幕)。如纯 CPU 不够再上 Desktop Duplication + D3D。
+// 捕获用 D3D11 Desktop Duplication API, 直接从 GPU 获取桌面帧。
+// 光标由 API 原生提供位置 + 形状数据, 软件合成到帧上。
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <windowsx.h>              // GET_X_LPARAM / GET_Y_LPARAM
-#include <timeapi.h>               // timeBeginPeriod / timeEndPeriod
-#include <cstdio>                  // swprintf
-#include <cstdint>                 // uint8_t / int64_t
-#include <cwchar>                  // wcsrchr / wcscpy_s
-#include "plugin_api.h"            // 外部识别插件 (DLL) 接口
+#include <windowsx.h>
+#include <d3d11.h>
+#include <dxgi1_2.h>
+#include <timeapi.h>
+#include <cstdio>
+#include <cstdint>
+#include <cwchar>
+#include <vector>
+#include "plugin_api.h"
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "winmm.lib")
 
 // ======================= 可配置参数 =======================
-static int g_targetFps = 120;      // 预览目标帧率上限
+static int g_targetFps = 120;
 
-static const int B    = 2;         // 边框线宽(像素), 越小越细
-static const int GRAB = 10;        // 四角抓取判定长度(沿边方向)
-static const int MINW = 40;        // 选区最小宽
-static const int MINH = 40;        // 选区最小高
+static const int B    = 2;
+static const int GRAB = 10;
+static const int MINW = 40;
+static const int MINH = 40;
 
-// 选区默认位置 / 大小 (内部捕获区域, 屏幕坐标)
 static int g_initRx = 300, g_initRy = 200, g_initRw = 640, g_initRh = 360;
 
-// 外部识别插件 DLL 文件名 (从 exe 所在目录加载)
 static const wchar_t* g_pluginName = L"plugin.dll";
 // =========================================================
 
@@ -39,18 +43,14 @@ static screencap_on_init_fn   g_on_init  = nullptr;
 static screencap_on_frame_fn  g_on_frame = nullptr;
 static screencap_on_exit_fn   g_on_exit  = nullptr;
 
-// 从 exe 所在目录加载插件, 解析三个导出函数 (都可选)。
-// 返回 false 表示 DLL 文件未能加载 (识别功能将被禁用, 程序仍可运行)。
 static bool loadPlugin() {
     wchar_t path[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, path, MAX_PATH);     // exe 完整路径
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
     wchar_t* slash = wcsrchr(path, L'\\');
     if (slash) wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - path), g_pluginName);
-
     g_plugin = LoadLibraryW(path);
-    if (!g_plugin) g_plugin = LoadLibraryW(g_pluginName);  // 退而求其次: 按搜索路径找
+    if (!g_plugin) g_plugin = LoadLibraryW(g_pluginName);
     if (!g_plugin) return false;
-
     g_on_init  = (screencap_on_init_fn)  GetProcAddress(g_plugin, "on_init");
     g_on_frame = (screencap_on_frame_fn) GetProcAddress(g_plugin, "on_frame");
     g_on_exit  = (screencap_on_exit_fn)  GetProcAddress(g_plugin, "on_exit");
@@ -58,70 +58,19 @@ static bool loadPlugin() {
 }
 
 static void unloadPlugin() {
-    if (g_on_exit) g_on_exit();          // 先让插件清理
+    if (g_on_exit) g_on_exit();
     g_on_init = nullptr; g_on_frame = nullptr; g_on_exit = nullptr;
     if (g_plugin) { FreeLibrary(g_plugin); g_plugin = nullptr; }
 }
 
-// ---- 通用实时帧 (零依赖): 任何识别算法都从这里开始 ----
-// 像素布局: BGRA, 8位/通道, top-down(第一行在前), 连续, stride = width*4
 struct Frame {
-    const uint8_t* data;        // 像素首地址 (BGRA)
+    const uint8_t* data;
     int     width;
     int     height;
-    int     stride;             // 每行字节数
+    int     stride;
     int64_t timestampMs;
 };
 
-// ---- 捕获用的 GDI 资源 (尺寸变化时才重建) ----
-// 用 CreateDIBSection 而非 CreateCompatibleBitmap: 抓完帧后像素直接可读(bits),
-// 无需再 GetDIBits 拷贝 —— 既能显示, 又能零拷贝交给识别算法。
-struct Capture {
-    HDC     screenDC = nullptr;
-    HDC     memDC    = nullptr;
-    HBITMAP bmp      = nullptr;
-    void*   bits     = nullptr;   // 直接指向 BGRA 像素
-    int     w = 0, h = 0;
-
-    bool init(int width, int height) {
-        release();
-        w = width; h = height;
-        screenDC = GetDC(nullptr);
-        if (!screenDC) return false;
-        memDC = CreateCompatibleDC(screenDC);
-        if (!memDC) return false;
-
-        BITMAPINFO bi = {};
-        bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-        bi.bmiHeader.biWidth       = w;
-        bi.bmiHeader.biHeight      = -h;       // 负 = top-down
-        bi.bmiHeader.biPlanes      = 1;
-        bi.bmiHeader.biBitCount    = 32;       // BGRA
-        bi.bmiHeader.biCompression = BI_RGB;
-
-        bmp = CreateDIBSection(screenDC, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-        if (!bmp) return false;
-        SelectObject(memDC, bmp);
-        return true;
-    }
-    void grab(int srcX, int srcY) {
-        BitBlt(memDC, 0, 0, w, h, screenDC, srcX, srcY, SRCCOPY);
-        // 抓完: (uint8_t*)bits 即本帧 BGRA 数据, stride = w*4
-    }
-    void release() {
-        if (bmp)      { DeleteObject(bmp);            bmp = nullptr; bits = nullptr; }
-        if (memDC)    { DeleteDC(memDC);              memDC = nullptr; }
-        if (screenDC) { ReleaseDC(nullptr, screenDC); screenDC = nullptr; }
-    }
-    ~Capture() { release(); }
-};
-
-static Capture g_cap;
-static HWND    g_selector = nullptr;   // 选区线框窗口
-static HWND    g_preview  = nullptr;   // 预览窗口
-static HDC     g_previewDC = nullptr;  // 复用的预览窗口 DC
-
-// 毫秒时间戳 (用于给每帧打时间)
 static int64_t nowMs() {
     static LARGE_INTEGER f = {};
     if (!f.QuadPart) QueryPerformanceFrequency(&f);
@@ -130,14 +79,238 @@ static int64_t nowMs() {
 }
 
 // ============================================================
-//  每抓到一帧调用: 转交给外部插件 DLL 的 on_frame。
-//  插件可就地修改像素(BGRA), 修改后的结果会显示在预览窗口里。
-//  注意: 在抓屏线程上同步执行, 插件处理太重会拖累预览帧率。
+//  D3D11 Desktop Duplication 捕获引擎
+// ============================================================
+class D3D11Capture {
+    ID3D11Device*             device     = nullptr;
+    ID3D11DeviceContext*      ctx        = nullptr;
+    IDXGIOutputDuplication*   dupl       = nullptr;
+    ID3D11Texture2D*          stagingTex = nullptr;
+    int                       stageW = 0, stageH = 0;
+
+    HMONITOR curMonitor = nullptr;
+    int      monX = 0, monY = 0, monW = 0, monH = 0;
+
+    bool frameAcquired = false;
+    bool mapped = false;
+
+    const uint8_t* frameBits  = nullptr;
+    int            frameW     = 0;
+    int            frameH     = 0;
+    int            frameStride = 0;
+
+    void destroyDupl() {
+        done();
+        if (dupl) { dupl->Release(); dupl = nullptr; }
+        curMonitor = nullptr;
+    }
+
+    void destroyStaging() {
+        if (stagingTex) { stagingTex->Release(); stagingTex = nullptr; }
+        stageW = stageH = 0;
+    }
+
+    bool createDuplForMonitor(HMONITOR hmon, int mx, int my, int mw, int mh) {
+        destroyDupl();
+        curMonitor = hmon;
+        monX = mx; monY = my; monW = mw; monH = mh;
+
+        IDXGIDevice*  dxgiDev  = nullptr;
+        IDXGIAdapter* adapter  = nullptr;
+        IDXGIOutput*  output   = nullptr;
+        IDXGIOutput1* output1  = nullptr;
+        bool ok = false;
+
+        if (FAILED(device->QueryInterface(IID_PPV_ARGS(&dxgiDev)))) goto fail;
+        if (FAILED(dxgiDev->GetParent(IID_PPV_ARGS(&adapter))))    goto fail;
+
+        for (UINT i = 0; adapter->EnumOutputs(i, &output) != DXGI_ERROR_NOT_FOUND; ++i) {
+            DXGI_OUTPUT_DESC desc;
+            output->GetDesc(&desc);
+            if (desc.Monitor == hmon) {
+                if (SUCCEEDED(output->QueryInterface(IID_PPV_ARGS(&output1))) &&
+                    SUCCEEDED(output1->DuplicateOutput(device, &dupl))) {
+                    ok = true;
+                }
+                if (output1) output1->Release();
+                output->Release();
+                break;
+            }
+            output->Release();
+            output = nullptr;
+        }
+
+    fail:
+        if (adapter) adapter->Release();
+        if (dxgiDev) dxgiDev->Release();
+        if (!ok) { curMonitor = nullptr; return false; }
+        return true;
+    }
+
+    bool ensureStaging(int w, int h) {
+        if (stagingTex && stageW == w && stageH == h) return true;
+        destroyStaging();
+        D3D11_TEXTURE2D_DESC desc = {};
+        desc.Width          = (UINT)w;
+        desc.Height         = (UINT)h;
+        desc.MipLevels      = 1;
+        desc.ArraySize      = 1;
+        desc.Format         = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage          = D3D11_USAGE_STAGING;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        desc.BindFlags      = 0;
+        if (FAILED(device->CreateTexture2D(&desc, nullptr, &stagingTex)))
+            return false;
+        stageW = w; stageH = h;
+        return true;
+    }
+
+public:
+    D3D11Capture() = default;
+    ~D3D11Capture() { release(); }
+
+    bool init() {
+        UINT flags = D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+        D3D_FEATURE_LEVEL levels[] = {
+            D3D_FEATURE_LEVEL_11_1,
+            D3D_FEATURE_LEVEL_11_0
+        };
+        D3D_FEATURE_LEVEL selected;
+        HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE,
+                                        nullptr, flags, levels,
+                                        ARRAYSIZE(levels), D3D11_SDK_VERSION,
+                                        &device, &selected, &ctx);
+        if (FAILED(hr)) {
+            hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP,
+                                    nullptr, flags, levels,
+                                    ARRAYSIZE(levels), D3D11_SDK_VERSION,
+                                    &device, &selected, &ctx);
+        }
+        return SUCCEEDED(hr);
+    }
+
+    bool grab(int roiX, int roiY, int roiW, int roiH) {
+        done();
+
+        if (roiW < 1) roiW = 1;
+        if (roiH < 1) roiH = 1;
+
+        // 检查选区是否移到了另一个显示器
+        POINT center = { roiX + roiW / 2, roiY + roiH / 2 };
+        HMONITOR hmon = MonitorFromPoint(center, MONITOR_DEFAULTTONEAREST);
+        if (hmon != curMonitor) {
+            MONITORINFOEXW mi = { sizeof(MONITORINFOEXW) };
+            GetMonitorInfoW(hmon, &mi);
+            if (!createDuplForMonitor(hmon,
+                                      mi.rcMonitor.left, mi.rcMonitor.top,
+                                      mi.rcMonitor.right  - mi.rcMonitor.left,
+                                      mi.rcMonitor.bottom - mi.rcMonitor.top)) {
+                return false;
+            }
+        }
+
+        if (!dupl) return false;
+        if (!ensureStaging(roiW, roiH)) return false;
+
+        IDXGIResource* desktopRes = nullptr;
+        DXGI_OUTDUPL_FRAME_INFO fi = {};
+        HRESULT hr = dupl->AcquireNextFrame(16, &fi, &desktopRes);
+        if (FAILED(hr)) {
+            // DXGI_ERROR_ACCESS_LOST: 分辨率/显示模式变更, 需要重建 dupl
+            if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET
+                || hr == DXGI_ERROR_ACCESS_LOST)
+                destroyDupl();
+            return false;
+        }
+        frameAcquired = true;
+
+        // 获取桌面纹理
+        ID3D11Texture2D* desktopTex = nullptr;
+        if (FAILED(desktopRes->QueryInterface(IID_PPV_ARGS(&desktopTex)))) {
+            desktopRes->Release();
+            done();
+            return false;
+        }
+
+        int offsetX = roiX - monX;
+        int offsetY = roiY - monY;
+
+        D3D11_BOX box = {
+            (UINT)max(0, offsetX),
+            (UINT)max(0, offsetY),
+            0,
+            (UINT)min(offsetX + roiW, monW),
+            (UINT)min(offsetY + roiH, monH),
+            1
+        };
+        int actualW = (int)(box.right  - box.left);
+        int actualH = (int)(box.bottom - box.top);
+        if (actualW < 1) actualW = 1;
+        if (actualH < 1) actualH = 1;
+
+        ctx->CopySubresourceRegion(stagingTex, 0, 0, 0, 0,
+                                    desktopTex, 0, &box);
+        desktopTex->Release();
+        desktopRes->Release();
+
+        // 映射到 CPU
+        D3D11_MAPPED_SUBRESOURCE ms = {};
+        if (FAILED(ctx->Map(stagingTex, 0, D3D11_MAP_READ, 0, &ms))) {
+            done();
+            return false;
+        }
+        mapped = true;
+
+        frameBits   = (const uint8_t*)ms.pData;
+        frameStride = (int)ms.RowPitch;
+        frameW      = actualW;
+        frameH      = actualH;
+
+        return true;
+    }
+
+    void done() {
+        if (mapped && ctx && stagingTex) {
+            ctx->Unmap(stagingTex, 0);
+            mapped = false;
+        }
+        if (frameAcquired && dupl) {
+            dupl->ReleaseFrame();
+            frameAcquired = false;
+        }
+        frameBits = nullptr;
+    }
+
+    void release() {
+        done();
+        destroyStaging();
+        if (dupl) { dupl->Release(); dupl = nullptr; }
+        if (ctx)    { ctx->Release();    ctx = nullptr; }
+        if (device) { device->Release(); device = nullptr; }
+        curMonitor = nullptr;
+    }
+
+    const uint8_t* bits()   const { return frameBits; }
+    int width()             const { return frameW; }
+    int height()            const { return frameH; }
+    int stride()            const { return frameStride; }
+};
+
+static D3D11Capture            g_cap;
+static HWND                    g_selector = nullptr;
+static HWND                    g_preview  = nullptr;
+
+static std::vector<uint8_t>    g_displayBuf;
+static int                     g_dispW = 0, g_dispH = 0;
+
+// ============================================================
+//  每抓到一帧调用: 转交给外部插件 DLL 的 on_frame
 // ============================================================
 static void onFrame(const Frame& f) {
     if (!g_on_frame) return;
     ScreenFrame sf;
-    sf.data        = const_cast<uint8_t*>(f.data);   // 允许插件就地修改
+    sf.data        = const_cast<uint8_t*>(f.data);
     sf.width       = f.width;
     sf.height      = f.height;
     sf.stride      = f.stride;
@@ -145,21 +318,78 @@ static void onFrame(const Frame& f) {
     g_on_frame(&sf);
 }
 
-// 把内存位图画到预览窗口: 等大则 1:1 直拷, 否则快速拉伸适配
 static void blitToWindow(HWND hwnd, HDC hdc) {
+    if (g_displayBuf.empty()) return;
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth       = g_dispW;
+    bi.bmiHeader.biHeight      = -g_dispH;
+    bi.bmiHeader.biPlanes      = 1;
+    bi.bmiHeader.biBitCount    = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
     RECT rc; GetClientRect(hwnd, &rc);
     int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
-    if (cw == g_cap.w && ch == g_cap.h) {
-        BitBlt(hdc, 0, 0, cw, ch, g_cap.memDC, 0, 0, SRCCOPY);
-    } else {
-        SetStretchBltMode(hdc, COLORONCOLOR);
-        StretchBlt(hdc, 0, 0, cw, ch, g_cap.memDC, 0, 0, g_cap.w, g_cap.h, SRCCOPY);
+    SetStretchBltMode(hdc, COLORONCOLOR);
+    StretchDIBits(hdc, 0, 0, cw, ch,
+                  0, 0, g_dispW, g_dispH,
+                  g_displayBuf.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+}
+
+// ---- GDI 光标绘制 (预览显示用) ----
+// 用 GetCursorInfo + DrawIconEx, 绕过 Desktop Duplication 光标 API 的兼容性问题。
+static HDC      g_cursorDC  = nullptr;
+static HBITMAP  g_cursorDIB = nullptr;
+static uint8_t* g_cursorBits = nullptr;
+static int      g_cursorBufW = 0, g_cursorBufH = 0;
+
+static void ensureCursorDIB(int w, int h) {
+    if (g_cursorDC && g_cursorBufW >= w && g_cursorBufH >= h) return;
+    if (g_cursorDIB) DeleteObject(g_cursorDIB);
+    if (g_cursorDC)  DeleteDC(g_cursorDC);
+    g_cursorDC = CreateCompatibleDC(nullptr);
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth       = w;
+    bi.bmiHeader.biHeight      = -h;
+    bi.bmiHeader.biPlanes      = 1;
+    bi.bmiHeader.biBitCount    = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    g_cursorDIB = CreateDIBSection(g_cursorDC, &bi, DIB_RGB_COLORS,
+                                    (void**)&g_cursorBits, nullptr, 0);
+    SelectObject(g_cursorDC, g_cursorDIB);
+    g_cursorBufW = w; g_cursorBufH = h;
+}
+
+static void drawCursorOnDisplay(uint8_t* buf, int w, int h, int stride,
+                                 int roiScreenX, int roiScreenY) {
+    CURSORINFO ci = { sizeof(CURSORINFO) };
+    GetCursorInfo(&ci);
+    if (!(ci.flags & CURSOR_SHOWING)) return;
+    ensureCursorDIB(w, h);
+    if (!g_cursorBits) return;
+
+    // buf → temp DIB
+    const uint8_t* src = buf;
+    for (int y = 0; y < h; ++y) {
+        memcpy(g_cursorBits + y * w * 4, src, (size_t)w * 4);
+        src += stride;
+    }
+
+    DrawIconEx(g_cursorDC,
+               ci.ptScreenPos.x - roiScreenX,
+               ci.ptScreenPos.y - roiScreenY,
+               ci.hCursor, 0, 0, 0, nullptr, DI_NORMAL);
+
+    // temp DIB → buf
+    uint8_t* dst = buf;
+    for (int y = 0; y < h; ++y) {
+        memcpy(dst, g_cursorBits + y * w * 4, (size_t)w * 4);
+        dst += stride;
     }
 }
 
-// 读取选区线框当前的"内部矩形"(屏幕坐标), 抓屏并刷新预览
 static void captureAndShow() {
-    if (!g_selector || !g_preview || !g_previewDC) return;
+    if (!g_selector || !g_preview) return;
     RECT wr; GetWindowRect(g_selector, &wr);
     int x = wr.left + B;
     int y = wr.top  + B;
@@ -167,50 +397,64 @@ static void captureAndShow() {
     int h = (wr.bottom - B) - y;
     if (w < 1) w = 1;
     if (h < 1) h = 1;
-    if (w != g_cap.w || h != g_cap.h) {       // 选区尺寸变了 -> 重建捕获位图
-        if (!g_cap.init(w, h)) return;
-        // 预览窗口客户区同步调整为与选区等大 (1:1 显示)
-        RECT pr = { 0, 0, w, h };
+
+    if (!g_cap.grab(x, y, w, h)) return;
+
+    Frame f{ g_cap.bits(), g_cap.width(), g_cap.height(), g_cap.stride(), nowMs() };
+    onFrame(f);
+
+    int dstStride = g_cap.width() * 4;
+    g_displayBuf.resize(g_cap.height() * dstStride);
+    const uint8_t* src = g_cap.bits();
+    uint8_t* dst = g_displayBuf.data();
+    for (int row = 0; row < g_cap.height(); ++row) {
+        memcpy(dst, src, dstStride);
+        src += g_cap.stride();
+        dst += dstStride;
+    }
+    g_dispW = g_cap.width();
+    g_dispH = g_cap.height();
+
+    // 用 GDI 绘制光标到显示缓冲 (ROI 屏幕原点 = x, y)
+    drawCursorOnDisplay(g_displayBuf.data(), g_dispW, g_dispH, dstStride, x, y);
+
+    g_cap.done();
+
+    if (g_dispW > 0 && g_dispH > 0) {
+        RECT pr = { 0, 0, g_dispW, g_dispH };
         AdjustWindowRect(&pr, WS_OVERLAPPEDWINDOW, FALSE);
         SetWindowPos(g_preview, nullptr, 0, 0,
                      pr.right - pr.left, pr.bottom - pr.top,
                      SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
-    g_cap.grab(x, y);
-    GdiFlush();   // 确保 BitBlt 已写入 DIBSection 内存, 插件才能读到正确像素
 
-    // 抓到原始帧 -> 交给插件 (零拷贝, 直接引用 DIBSection 像素)
-    Frame f{ (const uint8_t*)g_cap.bits, g_cap.w, g_cap.h, g_cap.w * 4, nowMs() };
-    onFrame(f);
-
-    blitToWindow(g_preview, g_previewDC);   // 显示(可能被插件修改过的)像素
+    InvalidateRect(g_preview, nullptr, FALSE);
+    UpdateWindow(g_preview);
 }
 
-// 根据窗口当前尺寸重建"空心细线框"的窗口区域 (外框 - 中间洞 = 边框环)
 static void updateRegion(HWND hwnd) {
     RECT c; GetClientRect(hwnd, &c);
     int W = c.right, H = c.bottom;
     HRGN outer = CreateRectRgn(0, 0, W, H);
     HRGN hole  = CreateRectRgn(B, B, W - B, H - B);
-    CombineRgn(outer, outer, hole, RGN_DIFF);     // 只剩边框环
-    SetWindowRgn(hwnd, outer, TRUE);              // 窗口接管 outer 句柄
+    CombineRgn(outer, outer, hole, RGN_DIFF);
+    SetWindowRgn(hwnd, outer, TRUE);
     DeleteObject(hole);
 }
 
 // ---------------- 选区线框窗口过程 ----------------
 LRESULT CALLBACK SelectorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
-    case WM_NCHITTEST: {                            // 只做缩放, 不做整体移动
+    case WM_NCHITTEST: {
         POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
         ScreenToClient(hwnd, &pt);
         RECT c; GetClientRect(hwnd, &c);
         int W = c.right, H = c.bottom;
-
         bool L  = pt.x < GRAB;
         bool R  = pt.x > W - GRAB;
         bool T  = pt.y < GRAB;
         bool Bo = pt.y > H - GRAB;
-        if (T && L) return HTCAPTION;    // 左上角 -> 整体平移(其余角仍为缩放)
+        if (T && L) return HTCAPTION;
         if (T && R) return HTTOPRIGHT;
         if (Bo && L) return HTBOTTOMLEFT;
         if (Bo && R) return HTBOTTOMRIGHT;
@@ -220,40 +464,31 @@ LRESULT CALLBACK SelectorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         if (pt.y > H - B) return HTBOTTOM;
         return HTNOWHERE;
     }
-
-    case WM_GETMINMAXINFO: {                        // 限制最小尺寸
+    case WM_GETMINMAXINFO: {
         MINMAXINFO* mmi = (MINMAXINFO*)lParam;
         mmi->ptMinTrackSize.x = MINW + 2 * B;
         mmi->ptMinTrackSize.y = MINH + 2 * B;
         return 0;
     }
-
     case WM_SIZE:
         updateRegion(hwnd);
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
-    case WM_MOVE:                                   // 移动后反色要按新位置重算
+    case WM_MOVE:
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
-
     case WM_ERASEBKGND:
         return 1;
-
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
         RECT c; GetClientRect(hwnd, &c);
-
-        // 纯红色边框。窗口区域已裁剪成边框环, 填满客户区即只显示那一圈。
         HBRUSH red = CreateSolidBrush(RGB(255, 0, 0));
         FillRect(hdc, &c, red);
         DeleteObject(red);
-
         EndPaint(hwnd, &ps);
         return 0;
     }
-
-    // 系统进入"缩放"模态循环时主循环暂停, 用定时器维持预览与反色框实时刷新
     case WM_ENTERSIZEMOVE:
         SetTimer(hwnd, 1, 15, nullptr);
         return 0;
@@ -264,7 +499,6 @@ LRESULT CALLBACK SelectorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         KillTimer(hwnd, 1);
         captureAndShow();
         return 0;
-
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -298,7 +532,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     timeBeginPeriod(1);
 
-    // 注册两个窗口类
+    if (!g_cap.init()) {
+        MessageBoxW(nullptr, L"D3D11 设备创建失败, 程序退出。", L"错误", MB_ICONERROR);
+        return 1;
+    }
+
     WNDCLASSW sc = {};
     sc.lpfnWndProc   = SelectorProc;
     sc.hInstance     = hInstance;
@@ -313,7 +551,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     pc.lpszClassName = L"ScreenCapPreview";
     RegisterClassW(&pc);
 
-    // 选区线框窗口: 外框 = 内部区域 + 四周边框
     int sx = g_initRx - B;
     int sy = g_initRy - B;
     int sw = g_initRw + 2 * B;
@@ -327,7 +564,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     if (!g_selector) return 1;
     updateRegion(g_selector);
 
-    // 预览窗口 (放在左上角, 默认与初始选区等大, 之后随选区拉伸适配)
     RECT pr = { 0, 0, g_initRw, g_initRh };
     AdjustWindowRect(&pr, WS_OVERLAPPEDWINDOW, FALSE);
     g_preview = CreateWindowExW(
@@ -338,22 +574,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         nullptr, nullptr, hInstance, nullptr);
     if (!g_preview) return 1;
     ShowWindow(g_preview, nCmdShow);
-    g_previewDC = GetDC(g_preview);
 
-    // ---- 环境就绪, 加载外部插件并初始化 ----
     if (!loadPlugin()) {
         MessageBoxW(g_preview,
                     L"未找到插件 plugin.dll (识别功能禁用)。\n程序仍会正常显示捕获画面。",
                     L"提示", MB_ICONINFORMATION);
     } else if (g_on_init) {
-        if (g_on_init() != 0) {              // 插件初始化失败 -> 中止
+        if (g_on_init() != 0) {
             MessageBoxW(g_preview, L"插件 on_init 返回失败, 程序退出。", L"错误", MB_ICONERROR);
             unloadPlugin();
             return 1;
         }
     }
 
-    // ---- 主循环: 抓屏 + 刷新预览 + FPS 统计 ----
     LARGE_INTEGER freq, last, fpsTimer;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&last);
@@ -385,7 +618,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
                 double fps = frameCount / sinceFps;
                 wchar_t title[160];
                 swprintf(title, 160, L"屏幕捕获预览  [%dx%d]  %.1f FPS  (ESC 退出)",
-                         g_cap.w, g_cap.h, fps);
+                         g_dispW, g_dispH, fps);
                 SetWindowTextW(g_preview, title);
                 frameCount = 0;
                 fpsTimer = now;
@@ -395,9 +628,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         }
     }
 
-    unloadPlugin();   // 调用插件 on_exit 并卸载 DLL
-    if (g_previewDC) ReleaseDC(g_preview, g_previewDC);
-    timeEndPeriod(1);
+    unloadPlugin();
     g_cap.release();
+    if (g_cursorDIB) DeleteObject(g_cursorDIB);
+    if (g_cursorDC)  DeleteDC(g_cursorDC);
+    timeEndPeriod(1);
     return 0;
 }

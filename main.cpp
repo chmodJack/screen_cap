@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cwchar>
 #include <vector>
+#include <shellapi.h>
 #include "plugin_api.h"
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -34,7 +35,7 @@ static const int MINH = 40;
 
 static int g_initRx = 300, g_initRy = 200, g_initRw = 640, g_initRh = 360;
 
-static const wchar_t* g_pluginName = L"plugin.dll";
+static wchar_t g_pluginName[MAX_PATH] = L"plugin.dll";
 // =========================================================
 
 // ---- 外部插件 (DLL) ----
@@ -528,9 +529,17 @@ LRESULT CALLBACK PreviewProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     timeBeginPeriod(1);
+
+    // 第一个命令行参数作为插件 DLL 文件名
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(pCmdLine, &argc);
+    if (argv && argc > 0) {
+        wcscpy_s(g_pluginName, MAX_PATH, argv[0]);
+        LocalFree(argv);
+    }
 
     if (!g_cap.init()) {
         MessageBoxW(nullptr, L"D3D11 设备创建失败, 程序退出。", L"错误", MB_ICONERROR);
@@ -576,9 +585,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     ShowWindow(g_preview, nCmdShow);
 
     if (!loadPlugin()) {
-        MessageBoxW(g_preview,
-                    L"未找到插件 plugin.dll (识别功能禁用)。\n程序仍会正常显示捕获画面。",
-                    L"提示", MB_ICONINFORMATION);
+        wchar_t msg[256];
+        swprintf(msg, 256, L"未找到插件 %s (识别功能禁用)。\n程序仍会正常显示捕获画面。", g_pluginName);
+        MessageBoxW(g_preview, msg, L"提示", MB_ICONINFORMATION);
     } else if (g_on_init) {
         if (g_on_init() != 0) {
             MessageBoxW(g_preview, L"插件 on_init 返回失败, 程序退出。", L"错误", MB_ICONERROR);

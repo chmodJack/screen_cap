@@ -30,3 +30,25 @@ set_target_properties(plugin PROPERTIES
     OUTPUT_NAME "plugin"
     PREFIX ""                                  # 不要 lib 前缀, 输出就叫 plugin.dll
     RUNTIME_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:screen_cap>")
+
+# ---- OpenCV 图像处理插件 plugin_opencv.dll ----
+# 使用 OpenCV 对每帧进行 Canny 边缘检测等实时处理。
+# 安装路径: C:\Users\hongyunz\share\opencv
+set(OpenCV_DIR "C:/Users/hongyunz/share/opencv/build" CACHE PATH "OpenCV cmake config directory")
+find_package(OpenCV QUIET PATHS "${OpenCV_DIR}" NO_DEFAULT_PATH)
+if (OpenCV_FOUND)
+    add_library(plugin_opencv SHARED plugin_opencv.cpp)
+    target_compile_definitions(plugin_opencv PRIVATE UNICODE _UNICODE)
+    if (MSVC)
+        target_compile_options(plugin_opencv PRIVATE /utf-8)
+    endif()
+    target_include_directories(plugin_opencv PRIVATE ${OpenCV_INCLUDE_DIRS})
+    target_link_libraries(plugin_opencv PRIVATE ${OpenCV_LIBS})
+    set_target_properties(plugin_opencv PROPERTIES
+        OUTPUT_NAME "plugin_opencv"
+        PREFIX ""
+        RUNTIME_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:screen_cap>")
+    message(STATUS "plugin_opencv: OpenCV found at ${OpenCV_DIR}, outputs plugin_opencv.dll")
+else()
+    message(STATUS "plugin_opencv: OpenCV NOT found at ${OpenCV_DIR}, skipping")
+endif()
